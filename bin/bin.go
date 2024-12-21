@@ -1,27 +1,27 @@
 package bin
 
 import (
-    "time"
-    //"context"
+	"time"
+	//"context"
+	"fmt"
+	"log"
+	"os"
 	"runtime/pprof"
 	"sync"
-	"os"
-	"log"
+
 	"github.com/stanford-esrg/lzr"
-	"fmt"
 )
 
-
 func LZRMain() {
-    // create a context that can be cancelled
-    //ctx, cancel := context.WithCancel(context.Background())
+	// create a context that can be cancelled
+	//ctx, cancel := context.WithCancel(context.Background())
 
 	start := time.Now()
 
-    //read in config
-    options, ok := lzr.Parse()
+	//read in config
+	options, ok := lzr.Parse()
 	if !ok {
-		fmt.Fprintln(os.Stderr,"Failed to parse command line options, exiting.")
+		fmt.Fprintln(os.Stderr, "Failed to parse command line options, exiting.")
 		return
 	}
 
@@ -29,48 +29,49 @@ func LZRMain() {
 	if options.CPUProfile != "" {
 		f, err := os.Create(options.CPUProfile)
 		if err != nil {
-            log.Fatal(err)
-        }
-        pprof.StartCPUProfile(f)
-        defer pprof.StopCPUProfile()
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
 
 	//initalize
-	ipMeta := lzr.ConstructPacketStateMap( options )
-    f := lzr.InitFile( options.Filename )
+	ipMeta := lzr.ConstructPacketStateMap(options)
+	f := lzr.InitFile(options.Filename)
 	lzr.InitParams()
 
-    writingQueue := lzr.ConstructWritingQueue( options.Workers )
-    pcapIncoming := lzr.ConstructPcapRoutine( options.Workers )
-	timeoutQueue := lzr.ConstructTimeoutQueue( options.Workers )
-    retransmitQueue := lzr.ConstructRetransmitQueue( options.Workers )
-    timeoutIncoming := lzr.PollTimeoutRoutine(
-        &ipMeta,timeoutQueue, retransmitQueue, options.Workers, options.Timeout, options.RetransmitSec )
-	incoming := lzr.ConstructIncomingRoutine( options.Workers )
+	pcapProcessing := make(chan bool, 2000000)
+	writingQueue := lzr.ConstructWritingQueue(options.Workers)
+	pcapIncoming := lzr.ConstructPcapRoutine(options.Workers)
+	timeoutQueue := lzr.ConstructTimeoutQueue(options.Workers)
+	retransmitQueue := lzr.ConstructRetransmitQueue(options.Workers)
+	timeoutIncoming := lzr.PollTimeoutRoutine(
+		&ipMeta, timeoutQueue, retransmitQueue, options.Workers, options.Timeout, options.RetransmitSec)
+	incoming := lzr.ConstructIncomingRoutine(options.Workers)
 	var incomingDone sync.WaitGroup
 	incomingDone.Add(options.Workers)
-    done := false
+	done := false
 	writing := false
 
-    // record to file
-    go func() {
-        for {
-            select {
-                case input := <-writingQueue:
-					writing = true
-                    f.Record( input, options.Handshakes )
-					writing = false
-                }
-        }
-    }()
-    //start all workers
+	// record to file
+	go func() {
+		for {
+			select {
+			case input := <-writingQueue:
+				writing = true
+				f.Record(input, options.Handshakes)
+				writing = false
+			}
+		}
+	}()
+	//start all workers
 
-    //read from zmap
+	//read from zmap
 
-	for i := 0; i < options.Workers; i ++ {
-        go func( i int ) {
-            //ExitCondition: incoming channel closed
-			if (i == options.Workers - 1) {
+	for i := 0; i < options.Workers; i++ {
+		go func(i int) {
+			//ExitCondition: incoming channel closed
+			if i == options.Workers-1 {
 				// a band-aid has been added to check to see if the number of items
 				// in ipMeta has stayed the same for numHandshakes * timeout*2 time
 				// if so, close. there is some non-deterministic
@@ -78,12 +79,12 @@ func LZRMain() {
 				// does not empty all the way
 				var infiniteLoop = false
 				var ipMetaSize = ipMeta.Count()
-				var intervalLoop = options.Timeout*lzr.NumHandshakes()*2
+				var intervalLoop = options.Timeout * lzr.NumHandshakes() * 2
 				go func() {
 					for {
-						time.Sleep(time.Duration(intervalLoop)*time.Second)
-						if (ipMetaSize == ipMeta.Count()) {
-							fmt.Fprintln(os.Stderr,"Infinite Loop, Breaking.")
+						time.Sleep(time.Duration(intervalLoop) * time.Second)
+						if ipMetaSize == ipMeta.Count() {
+							fmt.Fprintln(os.Stderr, "Infinite Loop, Breaking.")
 							infiniteLoop = true
 							return
 						} else {
@@ -93,100 +94,151 @@ func LZRMain() {
 				}()
 				for {
 					if ipMeta.IsEmpty() || infiniteLoop {
-						done=true
+						done = true
 						break
 					}
 					//slow down to prevent CPU busy looping
-					time.Sleep(1*time.Second)
-					fmt.Fprintln(os.Stderr,"Processing:", ipMeta.Count())
+					time.Sleep(2 * time.Second)
+					fmt.Fprintln(os.Stderr, "Processing:", ipMeta.Count())
+					fmt.Fprintln(os.Stderr, "Finish processing:", lzr.GetFinishCounter())
 				}
 			}
 
-	        for input := range incoming {
+			for input := range incoming {
 				if lzr.ReadZMap() {
 					toACK := true
 					toPUSH := false
-					lzr.SendAck( options, input, &ipMeta, timeoutQueue,
-						retransmitQueue, writingQueue, toACK, toPUSH, lzr.ACK)
+					lzr.SendAck(options, input, &ipMeta, timeoutQueue,
+						retransmitQueue, writingQueue, toACK, toPUSH, lzr.ACK, pcapProcessing)
 				} else {
-					 lzr.SendSyn( input, &ipMeta, timeoutQueue )
+					lzr.SendSyn(input, &ipMeta, timeoutQueue, pcapProcessing)
 				}
-				ipMeta.FinishProcessing( input )
-            }
+				ipMeta.FinishProcessing(input)
+			}
 			incomingDone.Done()
 			return
-        }(i)
+		}(i)
 	}
 
-
-    //read from pcap
-    for i := 0; i < options.Workers; i ++ {
-        go func( i int ) {
-            for input := range pcapIncoming {
-						//fmt.Println("pcap incoming")
-						//fmt.Println(input)
-                        inMap, startProcessing := ipMeta.IsStartProcessing( input )
-                        //if not in map, return
-                        if !inMap {
-                            continue
-                        }
-                        //if another thread is processing, put input back
-                        if !startProcessing {
-                            pcapIncoming <- input
-                            continue
-                        }
-				        lzr.HandlePcap(options, input, &ipMeta, timeoutQueue,
-							retransmitQueue, writingQueue )
-                        ipMeta.FinishProcessing( input )
-						//fmt.Println("finished pcap:")
-						//fmt.Println(input)
-            }
-        }(i)
-    }
-
-    //read from timeout
-    for i := 0; i < options.Workers; i ++ {
-		go func( i int ) {
+	//read from pcap
+	for i := 0; i < options.Workers; i++ {
+		go func(i int) {
+			for input := range pcapIncoming {
+				//fmt.Println("pcap incoming")
+				//fmt.Println(input)
+				inMap, startProcessing := ipMeta.IsStartProcessing(input)
+				//if not in map, return
+				if !inMap {
+					continue
+				}
+				//if another thread is processing, put input back
+				if !startProcessing {
+					pcapIncoming <- input
+					continue
+				}
+				lzr.HandlePcap(options, input, &ipMeta, timeoutQueue,
+					retransmitQueue, writingQueue, pcapProcessing)
+				ipMeta.FinishProcessing(input)
+				//fmt.Println("finished pcap:")
+				//fmt.Println(input)
+			}
+		}(i)
+	}
+	//read from timeout
+	for i := 0; i < options.Workers; i++ {
+		go func(i int) {
 
 			for input := range timeoutIncoming {
-                    inMap, startProcessing := ipMeta.IsStartProcessing( input )
-                    //if another thread is processing, put input back
-                    //if not in map, return
-                    if !inMap {
-                        continue
-                    }
-                    if !startProcessing {
-                        timeoutIncoming <- input
-                        continue
-                    }
-                    lzr.HandleTimeout( options, input, &ipMeta, timeoutQueue, retransmitQueue, writingQueue )
-                    ipMeta.FinishProcessing( input )
-		    }
-    }(i)
+				inMap, startProcessing := ipMeta.IsStartProcessing(input)
+				//if another thread is processing, put input back
+				//if not in map, return
+				if !inMap {
+					continue
+				}
+				if !startProcessing {
+					timeoutIncoming <- input
+					continue
+				}
+				lzr.HandleTimeout(options, input, &ipMeta, timeoutQueue, retransmitQueue, writingQueue, pcapProcessing)
+				ipMeta.FinishProcessing(input)
+			}
+		}(i)
 	}
 
-    //exit gracefully when done
-	incomingDone.Wait()
-
-    for {
-       if done && len(writingQueue) == 0 && !writing && len(timeoutQueue) == 0 {
-				if options.MemProfile != "" {
-					f, err := os.Create(options.MemProfile)
-					if err != nil {
-						log.Fatal(err)
+	//exit gracefully when done
+	doneChan := make(chan bool)
+	var procpkt sync.WaitGroup
+	go func() {
+		procpkt.Add(1)
+		doneInput := false
+		for {
+			select {
+			case <-doneChan:
+				doneInput = true
+				break
+			case <-pcapProcessing:
+				break
+			}
+			if doneInput {
+				break
+			}
+		}
+		timer := time.NewTimer(3 * time.Second)
+		finish := false
+		for {
+			select {
+			case <-pcapProcessing:
+				//fmt.Println("pcap processing")
+				clear := false
+				for {
+					select {
+					case <-pcapProcessing:
+					default:
+						clear = true
+						break
 					}
-					pprof.WriteHeapProfile(f)
-					f.Close()
+					if clear {
+						break
+					}
 				}
+				timer.Reset(3 * time.Second)
+				break
+			case <-timer.C:
+				finish = true
+				break
+			}
+			if finish {
+				break
+			}
+		}
+		fmt.Println("Finish processing packets.")
+		procpkt.Done()
+		return
+	}()
+
+	incomingDone.Wait()
+	doneChan <- true
+	procpkt.Wait()
+
+	close(pcapProcessing)
+
+	for {
+		if done && len(writingQueue) == 0 && !writing {
+			if options.MemProfile != "" {
+				f, err := os.Create(options.MemProfile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				pprof.WriteHeapProfile(f)
+				f.Close()
+			}
 			//closing file
 			f.F.Flush()
 			t := time.Now()
 			elapsed := t.Sub(start)
-			lzr.Summarize( elapsed )
-            return
-       }
-    }
-
-
+			lzr.Summarize(elapsed)
+			return
+		}
+	}
 
 } //end of main
